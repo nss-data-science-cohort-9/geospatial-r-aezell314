@@ -1,0 +1,361 @@
+---
+title: "Analyzing Aggravated Burglaries in Davidson County"
+output: html_notebook
+---
+
+# Data Preparation-------------------------------------------------------------------------------------------
+```{r}
+library(httr)
+library(jsonlite)
+library(sf)
+library(tidyverse)
+library(leaflet)
+library(usethis)
+library(janitor)
+```
+
+
+```{r}
+base_url <- "https://services2.arcgis.com/HdTo6HJqh92wn4D8/arcgis/rest/services/Metro_Nashville_Police_Department_Incidents_view/FeatureServer/0/query?where=1=1&outFields=*&f=json"
+
+params <- list(
+  where = "offense_description LIKE '%BURGLARY%AGGRAVATED' AND Incident_Occurred >= '2023-01-01 00:00:00' AND Incident_Occurred <= '2023-12-31 23:59:59'",
+  outFields = 'primary_key,incident_number,report_type,report_type_description,incident_status_code,incident_status_description,investigation_status,incident_occurred,incident_reported,incident_location,latitude,longitude,zip_code,location_code,location_description,offense_number,offense_nibrs,offense_description,weapon_primary,weapon_description,victim_number,domestic_related,victim_type,victim_description,mapped_location,victim_gender,victim_race,victim_ethnicity,victim_county_resident',
+  f = 'json'
+)
+
+url_obj <- parse_url(base_url)
+url_obj$query <- params
+full_url <- build_url(url_obj)
+
+response <- GET(full_url)
+data_parsed <- fromJSON(content(response, 'text', encoding = 'UTF-8'))
+
+burglaries <- data_parsed$features$attributes |>
+  mutate(Incident_Occurred = as.POSIXct(Incident_Occurred/1000, tz='America/Chicago'),
+         Incident_Reported = as.POSIXct(Incident_Reported/1000, tz='America/Chicago'))
+
+head(burglaries)
+```
+Getting Davidson county census tract populations:
+```{r}
+api_key <- Sys.getenv("MY_API_KEY")
+base_url <- sprintf("https://api.census.gov/data/2023/acs/acs5?get=NAME,B01001_001E&for=tract:*&in=state:47&in=county:037&key=%s", api_key)
+
+response <- GET(base_url)
+data_parsed <- fromJSON(content(response, 'text', encoding = 'UTF-8'))
+
+census_pop <- as_tibble(data_parsed) |> row_to_names(row_number = 1) |> rename(population=B01001_001E) |> mutate(tract = as.numeric(tract), county = as.numeric(county), state = as.numeric(state), population = as.numeric(population))
+
+head(census_pop)
+```
+
+```{r}
+api_key <- Sys.getenv("MY_API_KEY")
+base_url <- sprintf("https://api.census.gov/data/2023/acs/acs5/subject?get=NAME,S1901_C01_012E&for=tract:*&in=state:47&in=county:037&key=%s", api_key)
+
+response <- GET(base_url)
+data_parsed <- fromJSON(content(response, 'text', encoding = 'UTF-8'))
+
+census_income <- as_tibble(data_parsed) |> row_to_names(row_number = 1) |> rename(median_income=S1901_C01_012E) |> mutate(tract = as.numeric(tract), county = as.numeric(county), state = as.numeric(state), median_income = as.numeric(median_income))
+
+head(census_income)
+```
+
+
+
+```{r}
+census <- full_join(census_pop, census_income, by=c('NAME', 'tract', 'state', 'county'))
+
+census
+```
+Note that census tracts 980100 and 980200 seem to have bad data, with recorded populations of 0 and negative median incomes. 
+```{r}
+census |>
+  filter(population==0)
+```
+We'll replace those values with NA.
+```{r}
+census$population <- na_if(census$population, 0)
+census$median_income <- na_if(census$median_income, -666666666)
+```
+
+
+Reading in Davidson County census tract shapefile:
+```{r}
+DC_tracts <- st_read('../data/DC/DC.shp')
+DC_tracts
+```
+We can create a plot of our geospatial census tract data using ggplot. 
+```{r}
+DC_tracts |> 
+  ggplot() +
+  geom_sf()
+```
+```{r}
+# Renaming tracts column in DC_tracts and convert to numeric datatype to simplify future merging and plots
+DC_tracts <- DC_tracts |>
+  rename(tract=TRACTCE) |>
+  mutate(tract=as.numeric(tract))
+```
+
+
+Now we will perform a spatial join to determine the census tract in which each burglary occurred. 
+```{r}
+# Adding spatial geometry to burglaries data
+burglaries_geo <- st_as_sf(
+  burglaries |> drop_na(Latitude),
+  coords = c('Longitude', 'Latitude'),
+  crs = st_crs(DC_tracts)
+)
+
+# Spatial join to determine the census tract associated with each burglary
+burglaries_by_tract <- 
+  st_join(burglaries_geo, DC_tracts, join = st_within)
+
+burglaries_by_tract
+```
+
+Next we will merge in the census data, making sure that the final dataset contains all census tracts, even those with zero burglaries. To do this, we will use a full join. 
+
+```{r}
+census_burglaries <- full_join(burglaries_by_tract, census, by=c('tract'))
+
+census_burglaries
+```
+
+# Exploratory analysis-------------------------------------------------------------------------------------------
+
+Leaflet cluster map of burglaries in Nashville:
+```{r}
+leaflet(census_burglaries |> drop_na(tract)) |> 
+  addTiles() |> 
+  addMarkers(
+    clusterOptions = markerClusterOptions()
+  )
+```
+
+ 
+Which census tract had the highest number of burglaries? Which census tract had the highest number of burglaries per 1000 residents?
+```{r}
+burglary_totals <- census_burglaries |> 
+  st_drop_geometry() |> 
+  group_by(tract) |> 
+  distinct(Primary_Key) |>
+  count(name = "Num_Unique_Burglaries") |> 
+  ungroup() |>
+  inner_join(census, by='tract') |>
+  mutate(Burglaries_Per_Pop = Num_Unique_Burglaries/population*1000) |>
+  select(tract, Num_Unique_Burglaries, population, Burglaries_Per_Pop, median_income) |>
+  arrange(desc(Num_Unique_Burglaries))
+
+burglary_totals
+```
+```{r}
+burglary_totals |>
+  slice_max(Num_Unique_Burglaries)
+```
+```{r}
+burglary_totals |>
+  slice_max(Burglaries_Per_Pop)
+```
+We see that tract 16000 has the largest number of burglaries and also the largest rate of burglaries per 1000 residents.
+
+Plotting burglaries for tract 16000:
+
+```{r}
+tract_code = 16000
+
+DC_tracts |> 
+  filter(tract == tract_code) |>
+  ggplot() +
+  geom_sf() +
+  geom_sf(data = burglaries_by_tract |> filter(tract == tract_code)) +
+  labs(title=paste('Map of Burglaries in Census Tract',tract_code), subtitle='Davidson County, 2023')
+```
+Plot of Nashville census tracts shaded by burglary rate:
+```{r}
+# Merge burglary rates into DC_tracts so that we can incorporate things like burglary rates and median income into our plots
+DC_tracts_info <- full_join(DC_tracts, burglary_totals, by='tract')
+```
+
+
+```{r, fig.height=9, fig.width=9}
+DC_tracts_info |> 
+  ggplot() +
+  geom_sf(aes(fill = Burglaries_Per_Pop)) +
+  scale_fill_viridis_c(option = "plasma", direction = -1, alpha=0.8) + 
+  labs(title= 'Burglary Rates in Davidson County', subtitle = 'Tracts Shaded by Burglaries per Thousand Residents, 2023') +
+  theme_minimal()
+```
+```{r, fig.height=9, fig.width=9}
+DC_tracts_info |> 
+  ggplot() +
+  geom_sf(aes(fill = Num_Unique_Burglaries)) +
+  scale_fill_viridis_c(option = "plasma", direction = -1, alpha=0.8) + 
+  labs(title= 'Burglary Totals in Davidson County', subtitle = 'Tracts Shaded by Burglaries Total, 2023') +
+  theme_minimal()
+```
+
+Plot of burglaries in Nashville with tracts shaded by median income:
+
+```{r, fig.height=9, fig.width=9}
+DC_tracts_info |> 
+  ggplot() +
+  geom_sf(aes(fill = median_income)) +
+  scale_fill_viridis_c(option = "plasma", direction = -1, alpha=0.8) + 
+  geom_sf(data = burglaries_by_tract |> drop_na(tract), size = 0.1) +
+  labs(title= 'Burglaries in Davidson County', subtitle = 'Tracts Shaded by Median Income') +
+  theme_minimal()
+```
+
+There do seem to be a higher concentration of burglaries in lower-income tracts. We can investigate the strength of this correlation with a Poisson regression in the statistical modeling section below. 
+
+
+```{r}
+# Scatterplot showing distribution of burglary rate by median income
+burglary_totals |>
+  ggplot(aes(x=median_income, y=Burglaries_Per_Pop)) +
+  geom_point() + 
+  labs(x='Median Income', y='Burglaries per Thousand Residents', title='Burglary Rate versus Median Income', subtitle='For Davidson County Census Tracts, 2023')
+```
+The relationship between median income and burglary rate appears to be a curve, indicating that a Poisson model might be appropriate, since it is a model of log(burglary rate).
+
+To further investigate whether a Poisson model would be appropriate, we can look at the distribution of burglary rate in more detail. 
+
+```{r}
+burglary_totals |>
+  ggplot(aes(x=Burglaries_Per_Pop)) +
+  geom_histogram(fill='dodgerblue',color='black') + 
+  labs(x='Burglaries per Thousand Residents', y='Count', title='Distribution of Burglary Rates', subtitle='For Davidson County Census Tracts, 2023')
+```
+The above histogram shows a fair amount of variability in burglary rate; rates range from roughly 0 to 16 with most of the rates clustered between 0 and 5. The distribution is right skewed, like many Poisson distributions, rather than being normally distributed (as we would expect with a linear regression model). 
+
+We can also look at the distribution of burglary rates faceted by different ranges of median income. 
+
+```{r}
+# Convert from scientific notation to decimal notation
+options(scipen = 999)
+
+# Breaking the median income observations into categories
+burglary_totals$median_income_bins <- cut(burglary_totals$median_income, breaks = 12, dig.lab = 6)
+
+# Plotting the distribution of burglary rates by each bin of median income
+burglary_totals |>
+  ggplot(aes(x = Burglaries_Per_Pop)) +
+  geom_histogram(binwidth = 1, fill = "dodgerblue", color = "black") +
+  facet_wrap(~ median_income_bins, ncol = 2) +
+  labs(
+    title = "Burglary Rate Distribution Faceted by Median Income",
+    x = "Burglary Rate",
+    y = "Frequency"
+  ) +
+  theme_minimal()
+```
+If a Poisson model were appropriate, we would expect the distribution of burglary rate to be right-skewed for lower median incomes, and transition to more of a normal distribution as median income increases. For this dataset, we have a roughly uniform distribution for the lowest median income bucket. For the next highest median income bucket, we see a definite right skew in the burglary distribution. We have too few observations for the higher income buckets to discern a shape in the distribution. This requirement of the Poisson model does not seem to be met by our data. 
+
+```{r}
+# Comparing mean and variance of burglary rate within each median income bucket
+burglary_stats_by_income <- burglary_totals |> 
+  group_by(median_income_bins) |>
+  summarize(
+    Mean_Burglaries = mean(Burglaries_Per_Pop, na.rm = TRUE),
+    Variance_Burglaries = var(Burglaries_Per_Pop, na.rm = TRUE),
+    Num_Obs = n()
+  ) |>
+  mutate(
+  left_endpoint = as.numeric(str_extract(median_income_bins, "\\((.+),", group = 1)),
+  right_endpoint = as.numeric(str_extract(median_income_bins, ",(.+)]", group = 1)),
+  income_midpoint = right_endpoint-left_endpoint/2
+  )
+
+burglary_stats_by_income
+```
+We see that the for the lowest median income bucket, the variance (~17) is very different than the mean (~4.5), which violates one of the assumptions of a Poisson model (mean=variance for the target variable), possibly making it unfit for a Poisson regression model.
+
+Finally, another assumption of a Poisson model is that the log of the mean of the target variable is a linear function of the explanatory variable. We can assess this linearity assumption by looking at a plot of the logs of the empirical average burglary rates and plotting by median income.
+
+```{r}
+burglary_stats_by_income |>
+  ggplot(aes(x=income_midpoint, y=log(Mean_Burglaries))) +
+  geom_point() + 
+  geom_smooth(method='glm') +
+  labs(title='Log of Burglary Rate vs Median Income', subtitle='For Davidson County Census Tracts, 2023', y='Log of the Empirical Mean Burglary Rate', x='Median Income')
+```
+Median income and the log of burglary rate appears to have a weak linear association. 
+
+# Statistical Modeling-------------------------------------------------------------------------------------------
+```{r}
+burglaries_income_pop <- glm("Num_Unique_Burglaries ~ median_income",
+                    data = burglary_totals,
+                    family = "poisson",
+                    offset = log(population))
+
+summary(burglaries_income_pop)
+```
+```{r}
+burglaries_income_pop_coefs <- burglaries_income_pop |> coef() |> exp() 
+pct_change <- round((1-burglaries_income_pop_coefs['median_income'])*1000*100, 4)
+
+paste0('For 2 Davidson county census tracts with the same population, a increase in median income of $1,000 is associated with a ',pct_change,'% lower estimated average number of burglaries.')
+```
+
+Evaluating how well the model fits the data:
+
+```{r}
+exp(confint(burglaries_income_pop))
+```
+A 95% confidence interval for $e^{\beta_1}$ does not include 1, indicating median income is significantly associated with burglary rate.
+
+```{r}
+#Comparing model predictions to observed rates
+
+# Get the burglary rate values that the model predicts
+fitted_values <- predict(burglaries_income_pop, type = "response")
+residuals <- residuals(burglaries_income_pop, type = "response")
+observed_values <- burglary_totals |>
+  filter(!is.na(median_income)) |>
+  select(Num_Unique_Burglaries) |>
+  pull()
+
+predicted_vs_observed <- tibble(predicted_burglaries=fitted_values, observed_burglaries=observed_values, residual=residuals)
+```
+
+```{r}
+# Plotting observed vs. predicted burglary numbers
+predicted_vs_observed |>
+  ggplot(aes(x=predicted_burglaries, y=observed_burglaries)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed", size = 1) + # Add a y=x line, which would indicate observed=predicted 
+  labs(x = "Predicted Burglary Rates",
+     y = "Observed Burglary Rates",
+     title = "Observed vs. Predicted Burglary Rates")
+```
+```{r}
+# Plotting residuals vs. predicted burglary numbers
+predicted_vs_observed |>
+  ggplot(aes(x=predicted_burglaries, y=residual)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 0, color = "red", linetype = "dashed", size = 1) + # Add a y=0 line, which would indicate observed=predicted 
+  labs(x = "Predicted Burglary Rates",
+     y = "Residual",
+     title = "Residuals vs. Predicted Burglary Rates")
+```
+
+```{r}
+# Extract the residual deviance and degrees of freedom
+deviance <- summary(burglaries_income_pop)$deviance
+degrees_freedom <- summary(burglaries_income_pop)$df.residual
+
+# Calculate the p-value for the deviance test
+p_value_deviance <- 1 - pchisq(deviance, degrees_freedom)
+
+paste("Residual Deviance:", deviance)
+paste("Degrees of Freedom:", degrees_freedom)
+paste("P-value:", p_value_deviance)
+```
+
+The small p-value (0 < 0.05) returned by the deviance test suggests that our Poisson regression model is a poor fit. This could be due to overdispersion, where the variance of our observed values is greater than the mean at each level of the explanatory variable.
+
+
+
