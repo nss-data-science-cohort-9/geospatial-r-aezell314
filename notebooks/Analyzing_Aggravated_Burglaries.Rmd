@@ -117,31 +117,29 @@ Now we will perform a spatial join to determine the census tract in which each b
 burglaries_geo <- st_as_sf(
   burglaries |> drop_na(Latitude),
   coords = c('Longitude', 'Latitude'),
-  crs = st_crs(DC_tracts)
+  crs = st_crs(DC_tracts),
+  remove = FALSE
 )
 
 # Spatial join to determine the census tract associated with each burglary
+# Putting the tracts on the left makes sure that the final dataset contains all census tracts, even those with zero burglaries
+# It also removes any burglaries that our outside of Davidson County
 burglaries_by_tract <- 
-  st_join(burglaries_geo, DC_tracts, join = st_within)
+  st_join(DC_tracts, burglaries_geo, join = st_contains)
 
-burglaries_by_tract
-```
-
-Next we will merge in the census data, making sure that the final dataset contains all census tracts, even those with zero burglaries. To do this, we will use a full join. 
-
-```{r}
-census_burglaries <- full_join(burglaries_by_tract, census, by=c('tract'))
-
-census_burglaries
+burglaries_by_tract |>
+  st_drop_geometry()
 ```
 
 # Exploratory analysis-------------------------------------------------------------------------------------------
 
 Leaflet cluster map of burglaries in Nashville:
 ```{r}
-leaflet(census_burglaries |> drop_na(tract)) |> 
+leaflet(burglaries_by_tract |> drop_na(Longitude)) |> 
   addTiles() |> 
   addMarkers(
+    ~Longitude,
+    ~Latitude,
     clusterOptions = markerClusterOptions()
   )
 ```
@@ -149,15 +147,14 @@ leaflet(census_burglaries |> drop_na(tract)) |>
  
 Which census tract had the highest number of burglaries? Which census tract had the highest number of burglaries per 1000 residents?
 ```{r}
-burglary_totals <- census_burglaries |> 
+burglary_totals <- burglaries_by_tract |> 
   st_drop_geometry() |> 
   group_by(tract) |> 
-  distinct(Primary_Key) |>
-  count(name = "Num_Unique_Burglaries") |> 
+  summarize(Num_Unique_Burglaries = n_distinct(Incident_Number, na.rm=TRUE)) |>
   ungroup() |>
   inner_join(census, by='tract') |>
   mutate(Burglaries_Per_Pop = Num_Unique_Burglaries/population*1000) |>
-  select(tract, Num_Unique_Burglaries, population, Burglaries_Per_Pop, median_income, pop_density) |>
+  select(tract, Num_Unique_Burglaries, Burglaries_Per_Pop, population, median_income, pop_density) |>
   arrange(desc(Num_Unique_Burglaries))
 
 burglary_totals
@@ -181,13 +178,14 @@ DC_tracts |>
   filter(tract == tract_code) |>
   ggplot() +
   geom_sf() +
-  geom_sf(data = burglaries_by_tract |> filter(tract == tract_code)) +
+  geom_point(data = burglaries_by_tract |> filter(tract == tract_code), aes(x = Longitude, y = Latitude)) +
   labs(title=paste('Map of Burglaries in Census Tract',tract_code), subtitle='Davidson County, 2023')
 ```
 Plot of Nashville census tracts shaded by burglary rate:
 ```{r}
 # Merge burglary rates into DC_tracts so that we can incorporate things like burglary rates and median income into our plots
 DC_tracts_info <- full_join(DC_tracts, burglary_totals, by='tract')
+DC_tracts_info
 ```
 
 
@@ -199,6 +197,7 @@ DC_tracts_info |>
   labs(title= 'Burglary Rates in Davidson County', subtitle = 'Tracts Shaded by Burglaries per Thousand Residents, 2023') +
   theme_minimal()
 ```
+
 ```{r, fig.height=9, fig.width=9}
 DC_tracts_info |> 
   ggplot() +
@@ -215,7 +214,7 @@ DC_tracts_info |>
   ggplot() +
   geom_sf(aes(fill = median_income)) +
   scale_fill_viridis_c(option = "plasma", direction = -1, alpha=0.8) + 
-  geom_sf(data = burglaries_by_tract |> drop_na(tract), size = 0.1) +
+  geom_point(data = burglaries_by_tract |> drop_na(Incident_Number), aes(x = Longitude, y = Latitude), size = 0.5) +
   labs(title= 'Burglaries in Davidson County', subtitle = 'Tracts Shaded by Median Income') +
   theme_minimal()
 ```
@@ -229,29 +228,27 @@ DC_tracts_info |>
   ggplot() +
   geom_sf(aes(fill = pop_density)) +
   scale_fill_viridis_c(option = "plasma", direction = -1, alpha=0.8) + 
-  geom_sf(data = burglaries_by_tract |> drop_na(tract), size = 0.1) +
+  geom_point(data = burglaries_by_tract |> drop_na(Incident_Number), aes(x = Longitude, y = Latitude), size = 0.5) +
   labs(title= 'Burglaries in Davidson County', subtitle = 'Tracts Shaded by Population Density') +
   theme_minimal()
 ```
 There does seem to be a relationship between population density and number of burglaries. We can incorporate that into our Poisson regression model as well. 
 
 ```{r}
-# Scatterplot showing distribution of burglary rate by median income
+# Scatterplot showing burglary rate vs median income
 burglary_totals |>
   ggplot(aes(x=median_income, y=Burglaries_Per_Pop)) +
   geom_point() + 
-  geom_smooth() +
   labs(x='Median Income', y='Burglaries per Thousand Residents', title='Burglary Rate versus Median Income', subtitle='For Davidson County Census Tracts, 2023')
 ```
 The relationship between median income and burglary rate appears to be a curve, indicating that a Poisson model might be appropriate, since it is a model of log(burglary rate).
 
 ```{r}
-# Scatterplot showing distribution of burglary rate by median income
+# Scatterplot showing burglary rate vs population density
 burglary_totals |>
   ggplot(aes(x=pop_density, y=Burglaries_Per_Pop)) +
   geom_point() + 
-  geom_smooth() +
-  labs(x='Population Density', y='Burglaries per Thousand Residents', title='Burglary Rate versus Median Income', subtitle='For Davidson County Census Tracts, 2023')
+  labs(x='Population Density', y='Burglaries per Thousand Residents', title='Burglary Rate versus Population Density', subtitle='For Davidson County Census Tracts, 2023')
 ```
 There appears to be very little correlation between population density and burglary rate when we look at the scatterplot. 
 
@@ -327,11 +324,40 @@ burglaries_income_pop <- glm("Num_Unique_Burglaries ~ median_income",
 
 summary(burglaries_income_pop)
 ```
+
+
+```{r}
+# Adding model predictions to our scatterplot showing burglary rate vs median income
+pred_df <- tibble(median_income = seq(from = 0, to = max(burglary_totals$median_income, na.rm = TRUE), length.out = 200),
+population = 1000)
+
+pred_df$estimate <- predict(burglaries_income_pop, newdata = pred_df, type = 'response')
+
+burglary_totals |>
+  ggplot(aes(x=median_income, y=Burglaries_Per_Pop)) +
+  geom_point() + 
+  geom_line(data=pred_df, aes(x=median_income, y=estimate)) +
+  labs(x='Median Income', y='Burglaries per Thousand Residents', title='Poisson Regression for Burglary Rate versus Median Income', subtitle='For Davidson County Census Tracts, 2023')
+```
+
 ```{r}
 burglaries_income_pop_coefs <- burglaries_income_pop |> coef() |> exp() 
-pct_change <- round((1-burglaries_income_pop_coefs['median_income'])*1000*100, 4)
+burglaries_income_pop_coefs
+```
 
-paste0('For 2 Davidson county census tracts with the same population, an increase in median income of $1,000 is associated with a ',pct_change,'% lower estimated average number of burglaries.')
+```{r}
+# Multiplying coefs by 10,000 before exponentiating to get a better real-world idea of the influence
+adjusted_coefs <- burglaries_income_pop |> 
+                      coef() |>
+                      (\(b) exp(b * 10000))()
+adjusted_coefs
+```
+
+
+```{r}
+pct_change <- round((1-adjusted_coefs['median_income'])*100, 4)
+
+paste0('For 2 Davidson county census tracts with the same population, an increase in median income of $10,000 is associated with a ',pct_change,'% lower estimated average number of burglaries.')
 ```
 
 ```{r}
@@ -342,14 +368,29 @@ burglaries_income_pop_density <- glm("Num_Unique_Burglaries ~ median_income + po
 
 summary(burglaries_income_pop_density)
 ```
-Adding population density to the model lowers the AIC slightly, from 1727.9 to 1723.1, which indicates it improves the model's ability to explain the variation in burglary rates. 
+Adding population density to the model lowers the AIC slightly, from 1304.4 to 1303.3, which indicates it improves the model's ability to explain the variation in burglary rates. 
 
 ```{r}
 burglaries_income_pop_density_coefs <- burglaries_income_pop_density |> coef() |> exp() 
-pct_change_income <- round((1-burglaries_income_pop_density_coefs['median_income'])*1000*100, 4)
-pct_change_density <- round((burglaries_income_pop_density_coefs['pop_density']-1)*100*100, 4)
+burglaries_income_pop_density_coefs
+```
 
-paste0('For 2 Davidson county census tracts with the same population and the same population density, an increase in median income of $1,000 is associated with a ',pct_change_income,'% lower estimated average number of burglaries.')
+```{r}
+# Multiplying coefs by a scaling factor before exponentiating to get a better real-world idea of the influence
+adjusted_med_income_coef <- burglaries_income_pop_density |> 
+                      coef() |> (\(x) x['median_income'])() |> (\(b) exp(b * 10000))()
+
+adjusted_pop_dens_coef <- burglaries_income_pop_density |> 
+                      coef() |> (\(x) x['pop_density'])() |> (\(b) exp(b * 100))()
+
+adjusted_med_income_coef
+adjusted_pop_dens_coef
+```
+```{r}
+pct_change_income <- round((1-adjusted_med_income_coef)*100, 4)
+pct_change_density <- round((adjusted_pop_dens_coef-1)*100, 4)
+
+paste0('For 2 Davidson county census tracts with the same population and the same population density, an increase in median income of $10,000 is associated with a ',pct_change_income,'% lower estimated average number of burglaries.')
 
 paste0('For 2 Davidson county census tracts with the same population and the same median income, an increase in population density of 100 people per square kilometer is associated with a ',pct_change_density,'% higher estimated average number of burglaries.')
 ```
@@ -359,10 +400,11 @@ Evaluating how well the model fits the data:
 ```{r}
 exp(confint(burglaries_income_pop_density))
 ```
-When we create 95% confidence intervals for the exponentiated coefficients, we see neither of them includes 1, indicating median income and population density are significantly associated with burglary rate.
+When we create 95% confidence intervals for the exponentiated coefficients, we see the interval for median income does not include 1, suggesting it is significantly associated with burglary rate. The confident interval for population density does include 1, indicating population density is not significantly associated with burglary rate.
+
 
 ```{r}
-#Comparing model predictions to observed rates
+# Comparing model predictions to observed rates
 
 # Get the burglary rate values that the model predicts
 fitted_values <- predict(burglaries_income_pop_density, type = "response")
