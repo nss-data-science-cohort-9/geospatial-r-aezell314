@@ -339,6 +339,27 @@ burglary_totals |>
   geom_line(data=pred_df, aes(x=median_income, y=estimate)) +
   labs(x='Median Income', y='Burglaries per Thousand Residents', title='Poisson Regression for Burglary Rate versus Median Income', subtitle='For Davidson County Census Tracts, 2023')
 ```
+We can also look at the distribution of predicted probabilities for various values of median income, to see if it resembles a Poisson distribution.
+
+```{r}
+median_income <- seq(from = 20000, to = 180000, length.out = 5)
+population = 4000
+
+map(median_income, 
+    \(x) tibble(median_income = x, 
+                num_burglaries = 0:20, 
+                probability = dpois(0:20, 
+                                      lambda = predict(burglaries_income_pop,
+                                                   newdata = tibble(median_income = x, population = population), type = "response")
+                                    )
+                )
+    ) |> 
+  bind_rows() |> 
+  ggplot(aes(x = num_burglaries, y = probability)) +
+  geom_col() +
+  facet_wrap(~median_income)
+```
+As the average number of burglaries increases, we see the distribution move from a right skewed distribution to more of a normal distribution. 
 
 ```{r}
 burglaries_income_pop_coefs <- burglaries_income_pop |> coef() |> exp() 
@@ -370,6 +391,7 @@ summary(burglaries_income_pop_density)
 ```
 Adding population density to the model lowers the AIC slightly, from 1304.4 to 1303.3, which indicates it improves the model's ability to explain the variation in burglary rates. 
 
+       
 ```{r}
 burglaries_income_pop_density_coefs <- burglaries_income_pop_density |> coef() |> exp() 
 burglaries_income_pop_density_coefs
@@ -455,5 +477,52 @@ paste("P-value:", p_value_deviance)
 
 The small p-value (0 < 0.05) returned by the deviance test suggests that our Poisson regression model is a poor fit. This could be due to overdispersion, where the variance of our observed values is greater than the mean at each level of the explanatory variable.
 
+To test for overdispersion, we can run a dispersion test.
+
+```{r}
+library(AER)
+library(MASS)
+```
 
 
+```{r}
+dispersiontest(burglaries_income_pop_density)
+```
+Our p-value is less than alpha=0.05, so we reject the null hypothesis and conclude that the true dispersion of burglary counts is greater than 1. 
+
+
+Since we have good evidence our data is overdispersed, we can run a negative binomial regression model to account for this.
+```{r}
+burg_income_pop_dens_nb <- glm.nb(Num_Unique_Burglaries ~ median_income + pop_density + offset(log(population)),
+                    data = burglary_totals)
+
+summary(burg_income_pop_dens_nb)
+```
+The p-value for median income is statistically significant (using alpha=0.05); the p-value for population density is not statistically significant (using alpha=0.05). 
+
+```{r}
+burg_income_pop_dens_nb$theta
+```
+The theta parameter in our negative binomial model is used to correct for the overdispersion in our response variable.
+
+We can look at the distribution of predicted probabilities for various values of median incomes, to see if it resembles a Poisson distribution.
+```{r}
+median_income <- seq(from = 20000, to = 180000, length.out = 5)
+pop_density = 1200
+population = 4000
+
+map(median_income, 
+    \(x) tibble(median_income = x, 
+                num_burglaries = 0:20, 
+                probability = dnbinom(0:20, 
+                                      mu = predict(burg_income_pop_dens_nb,
+                                      newdata = tibble(median_income = x, population = population, pop_density = pop_density), type = "response"),
+                                      size = burg_income_pop_dens_nb$theta
+                                    )
+                )
+    ) |> 
+  bind_rows() |> 
+  ggplot(aes(x = num_burglaries, y = probability)) +
+  geom_col() +
+  facet_wrap(~median_income)
+```
